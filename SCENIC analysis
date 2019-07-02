@@ -1,0 +1,222 @@
+
+```{r exprMat}
+setwd("~/Donors")
+load("3donors_CT.Robj")
+exprMat <- as.matrix(donors13@raw.data)
+rownames(exprMat) <- sub("__chr..", "", rownames(exprMat))
+#Select only beta cells or alpha cells with the conditions INT and GFP
+exprMat <- exprMat[,rownames(donors13@data.info)[which(donors13@data.info$CT_TSNE=="Beta")]]
+exprMat <- exprMat[,rownames(donors13@data.info)[which(donors13@data.info$CT_TSNE=="Alpha" & (donors13@data.info$Condition=="INT" | donors13@data.info$Condition=="GFP"))]]
+saveRDS(exprMat, "data/exprMat.Rds")
+```
+
+```{r scenicOptions}
+org="hgnc"
+dbDir="~/databases"
+myDatasetTitle="3 donors"
+scenicOptions <- initializeScenic(org = org, dbDir = dbDir, datasetTitle = myDatasetTitle, nCores = 20)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+```{r cellInfo}
+head(donors13@data.info)
+dim(donors13@data.info)
+cellInfo <- donors13@data.info[, -c(1:3, 6:9)]
+colnames(cellInfo) <- c("donor", "condition", "cellType")
+saveRDS(cellInfo, "int/cellInfo.Rds")
+
+colVars <- list(cellType=c("Alpha" = "#7570b3", "Beta" = "#e7298a" , "Delta" = "#66a61e", "PP" =  "#1b9e77", "Duct" = "#a6761d", "Acinar" = "#e6ab02", "Mesenchymal" = "#d95f02"), condition=c("INT" = "#e41a1c", "GFP" = "#ffb90f", "AGG" = "#984ea3"), donor=c("D1" = "#377eb8", "D2" = "#4daf4a", "D3" = "#ff7f00"))
+saveRDS(colVars, "int/colVars.Rds")
+```
+
+```{r genefiltering}
+genesKept <- geneFiltering(exprMat, scenicOptions, minCountsPerGene = 5, minSamples = ncol(exprMat) * 0.01)
+exprMat_filtered <- exprMat[genesKept,]
+```
+
+```{r correlation}
+runCorrelation(exprMat_filtered, scenicOptions)
+```
+
+```{r run SCENIC}
+#possible normalisation/transformation
+#exprMat_filtered <- log(exprMat_filtered + 1)
+#exprMat <- log(exprMat + 1)
+runGenie3(exprMat_filtered, scenicOptions)
+
+scenicOptions@settings$verbose <- TRUE
+scenicOptions@settings$nCores <- 10
+scenicOptions@settings$seed <- 123
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+runSCENIC_2_createRegulons(scenicOptions)
+runSCENIC_3_scoreCells(scenicOptions, exprMat)
+```
+
+```{r binarization}
+#possible normalisation/transformation
+#exprMat <- log(exprMat+1)
+aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat)
+savedSelections <- shiny::runApp(aucellApp)
+
+newThresholds <- savedSelections$thresholds
+scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
+saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+runSCENIC_4_aucell_binarize(scenicOptions)
+```
+
+```{r heatmap}
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+scenicOptions@inputDatasetInfo$cellInfo <- "../int/cellInfo.Rds"
+scenicOptions@settings$devType <- "jpg"
+skipHeatmaps <- FALSE
+binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+
+.openDev <- function(fileName, devType, ...)
+{
+  if(devType=="pdf")
+    pdf(paste0(fileName, ".pdf"), ...)
+  
+  if(devType=="png")
+    png(paste0(fileName, ".png"), ...)
+  
+  if(devType=="cairo_pfd") # similar to Cairo::CairoPDF?
+    grDevices::cairo_pdf(paste0(fileName, ".pdf"), ...)
+}
+
+.openDevHeatmap <- function(fileName, devType)
+{
+  if(devType!="pdf") 
+  {
+    if(devType=="png") .openDev(fileName=fileName, devType=devType, width=1200,height=1200)
+    if(devType!="png") .openDev(fileName=fileName, devType=devType)
+    fileName <- NA
+  }else{
+    fileName <- paste0(fileName,".pdf")
+  }
+  return(fileName)
+}
+
+if(!skipHeatmaps){
+    regulonSelection <- loadInt(scenicOptions, "aucell_regulonSelection", ifNotExists="null", verbose=FALSE)
+    if(is.null(regulonSelection)) 
+      regulonSelection <- regulonSelections(binaryRegulonActivity, binaryRegulonActivity_nonDupl, minCells)
+    
+    cellInfo <- loadFile(scenicOptions, getDatasetInfo(scenicOptions, "cellInfo"), ifNotExists="null")
+    cellInfo <- data.frame(cellInfo)
+    colVars <- loadFile(scenicOptions, getDatasetInfo(scenicOptions, "colVars"), ifNotExists="null")
+    ### Plot heatmap:
+    for(selRegs in names(regulonSelection$labels))
+    {
+      if(length(regulonSelection[[selRegs]])>0)
+      {
+        regulonSelection[[selRegs]] <- regulonSelection[[selRegs]][which(regulonSelection[[selRegs]] %in% rownames(binaryRegulonActivity))]
+        binaryMat <- binaryRegulonActivity[regulonSelection[[selRegs]],,drop=FALSE]
+        
+        if(nrow(binaryMat)>0) 
+        {
+          fileName <- paste0(getOutName(scenicOptions, "s4_binaryActivityHeatmap"),selRegs)
+          fileName <- .openDevHeatmap(fileName=fileName, devType=getSettings(scenicOptions, "devType"))
+          
+          rowv <- ifelse(nrow(binaryMat) >= 2, T, NA)
+          colv <- ifelse(ncol(binaryMat) >= 2, T, NA)
+          
+          NMF::aheatmap(binaryMat, scale="none", revC=TRUE, main=selRegs,   
+                        annCol=cellInfo[colnames(binaryMat),, drop=FALSE],
+                        annColor=colVars,
+                        Rowv=rowv,
+                        Colv=colv,
+                        color = c("white", "black"),
+                        filename=fileName)
+          if(getSettings(scenicOptions, "devType")!="pdf") dev.off()
+        }else{
+          if(getSettings(scenicOptions, "verbose")) message(paste0("No regulons to plot for regulon selection '", selRegs, "'. Skipping."))
+        }
+      }
+    }
+  }
+```
+
+
+```{r tsne}
+require(philentropy)
+require(reshape2)
+
+binaryRegulonActivity2 <- t(binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])])
+distanceall <- philentropy::distance(binaryRegulonActivity2, method="jaccard")
+colnames(distanceall) <- rownames(distanceall) <- rownames(binaryRegulonActivity2)
+#saveRDS(distanceall, file="~/distanceall.Rds")
+
+#distanceall <- readRDS("distanceall.Rds")
+require(Rtsne)
+set.seed(123)
+tsnb <- Rtsne(distanceall, is_distance=TRUE, perplexity = 50)
+require(AUCell)
+cellInfo <- readRDS("../int/cellInfo.Rds")
+colVars <- readRDS("../int/colVars.Rds")
+
+tsneba <- tsnb$Y
+rownames(tsneba) <- rownames(distanceall)
+pdf(file="calculated_tsne.pdf")
+plotTsne_cellProps(tsneba, cellInfo=cellInfo, colVars=colVars)
+dev.off()
+```
+
+```{r Fisher test on condition and number of cells active for regulons}
+binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+binaryRegulonActivity <- binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])]
+
+#Condition GFP and AGG vs INT for betacells and GFP vs INT for alphacells
+nrow(binaryRegulonActivity)
+k <- data.frame(rownames=rownames(binaryRegulonActivity), "p-value"=0, "c interval low"=0, "c interval high"=0, "odds ratio"=0, "up_down"=0 )
+rownames(k) <- k[,1]
+k$rownames <- NULL
+a <- "INT"
+for (i in 1:144){
+  nregpcon <- matrix(c(sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition==a)])]),
+                       ncol(binaryRegulonActivity) - sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$Condition==a)])]),
+                     sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition!=a)])]),
+                     ncol(binaryRegulonActivity) - sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$Condition!=a)])])), ncol=2)
+
+l <- fisher.test(nregpcon)  
+k[i,1] <- l$p.value
+k[i,2] <- l$conf.int[1]
+k[i,3] <- l$conf.int[2]
+k[i,4] <- l$estimate[["odds ratio"]]
+if ((nregpcon[1,1]/nregpcon[2,1]) > (nregpcon[1,2]/nregpcon[2,2])){k[i,5] <- "UP"}
+else{k[i,5] <- "DOWN"}
+
+}
+View(k)
+rownames(k)[which(k$p.value<(0.05/144))]
+```
+
+```{r PCA}
+binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+binaryRegulonActivity <- binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])]
+pca <- prcomp(t(binaryRegulonActivity), scale.=FALSE)
+#make a barplot of the percentage the pca contributes
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+barplot(pca.var.per, main="Scree plot", xlab="Principal Component", ylab="Percent Variation")
+#make a pca plot with ggplot, first make the right format
+cellInfo <- readRDS("../int/cellInfo.Rds") #in nonormalisation/allcells
+pca.data <- data.frame(Cell=rownames(pca$x), X=pca$x[,1], Y=pca$x[,2])
+pca.data.m <- merge(pca.data, cellInfo, by=0)
+rownames(pca.data.m) <- pca.data.m$Row.names
+pca.data.m$Row.names <- NULL
+#make a pca plot with ggplot
+require(ggplot2)
+png(filename="PCA_of_binaryRegulonActivity_allcD.png", width=730, height = 573, res=100)
+ggplot(data=pca.data.m, aes(x=X, y=Y, color=donor)) +
+  geom_point() +
+  xlab(paste("PC1 - ", pca.var.per[1], "%", sep="")) +
+  ylab(paste("PC2 - ", pca.var.per[2], "%", sep="")) +
+  theme_bw() +
+  ggtitle("PCA plot alpha cells all donors") +
+  scale_color_manual(values=c("#377eb8", "#4daf4a", "#ff7f00"))
+dev.off()
+#Condition: "#999999", "#ffb90f", "#e41a1c"
+#Donor: "#377eb8", "#4daf4a", "#ff7f00"  
+```
