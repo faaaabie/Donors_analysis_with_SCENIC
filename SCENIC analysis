@@ -1,8 +1,13 @@
 
 ```{r exprMat}
+#To start analysing with SCENIC an expression matrix has to be created from the data.
+#Set the preffered directory.
 setwd("~/Donors")
+#Load the data, it is stored in an object with the Seurat class.
 load("3donors_CT.Robj")
+#The raw expression counts are present in the slot @raw.data
 exprMat <- as.matrix(donors13@raw.data)
+#Change the rownames so it does not include the chromosome number.
 rownames(exprMat) <- sub("__chr..", "", rownames(exprMat))
 #Select only beta cells or alpha cells with the conditions INT and GFP
 exprMat <- exprMat[,rownames(donors13@data.info)[which(donors13@data.info$CT_TSNE=="Beta")]]
@@ -11,6 +16,8 @@ saveRDS(exprMat, "data/exprMat.Rds")
 ```
 
 ```{r scenicOptions}
+#For download details of the databases check IIDP4stressedcells
+#ScenicOptions is created here with the function initializeScenic. The organism is human, so hgnc.
 org="hgnc"
 dbDir="~/databases"
 myDatasetTitle="3 donors"
@@ -19,56 +26,68 @@ saveRDS(scenicOptions, file="int/scenicOptions.Rds")
 ```
 
 ```{r cellInfo}
+#Create a file that contains the information on cellType and other factors that are interesting to color the cells by in a t-SNE and heatmap.
+#Get the celltype, condition and donor by extracting those columns from the slot @data.info.
 head(donors13@data.info)
 dim(donors13@data.info)
 cellInfo <- donors13@data.info[, -c(1:3, 6:9)]
 colnames(cellInfo) <- c("donor", "condition", "cellType")
 saveRDS(cellInfo, "int/cellInfo.Rds")
 
+#Make a list containing the colors that need to be assigned to the celltypes and the conditions.
 colVars <- list(cellType=c("Alpha" = "#7570b3", "Beta" = "#e7298a" , "Delta" = "#66a61e", "PP" =  "#1b9e77", "Duct" = "#a6761d", "Acinar" = "#e6ab02", "Mesenchymal" = "#d95f02"), condition=c("INT" = "#e41a1c", "GFP" = "#ffb90f", "AGG" = "#984ea3"), donor=c("D1" = "#377eb8", "D2" = "#4daf4a", "D3" = "#ff7f00"))
 saveRDS(colVars, "int/colVars.Rds")
 ```
 
 ```{r genefiltering}
+#Filter the genes with the function geneFiltering() from the SCENIC package. By setting minCountsPerGene the genes are filtered by total number of reads per gene. By setting minSamples the genes are filtered by the number of cells in which the gene is detected.
 genesKept <- geneFiltering(exprMat, scenicOptions, minCountsPerGene = 5, minSamples = ncol(exprMat) * 0.01)
 exprMat_filtered <- exprMat[genesKept,]
 ```
 
 ```{r correlation}
+#Run a Spearman correlation on the genes. This will be used to find if the expression of a gene is is positively or negatively correlated with the expression of a TF.
 runCorrelation(exprMat_filtered, scenicOptions)
 ```
 
 ```{r run SCENIC}
+#The steps to run SCENIC, with wrapper functions.
 #possible normalisation/transformation
-#exprMat_filtered <- log(exprMat_filtered + 1)
 #exprMat <- log(exprMat + 1)
 runGenie3(exprMat_filtered, scenicOptions)
 
+#Change some settings to get resproducable results and use less cores when running on a cluster.
 scenicOptions@settings$verbose <- TRUE
 scenicOptions@settings$nCores <- 10
 scenicOptions@settings$seed <- 123
+#This creates the co-expression modules by taking the result from GENIE3 and the Spearman correlation.
 runSCENIC_1_coexNetwork2modules(scenicOptions)
+#This uses RcisTarget to check for motif enrichment in the genes which are under the control of a TF. This results in regulons.
 runSCENIC_2_createRegulons(scenicOptions)
+#The gene regulatory network/regulons can now be used to score the cells for activity of the regulon by calculating the AUC.
 runSCENIC_3_scoreCells(scenicOptions, exprMat)
 ```
 
 ```{r binarization}
 #possible normalisation/transformation
 #exprMat <- log(exprMat+1)
+#Adjust the thresholds of the regulons that determines if they are active in cells, and select only part of the cells with a shiny app.
 aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat)
 savedSelections <- shiny::runApp(aucellApp)
 
+#Save the thresholds in a RDS file and change the filename in scenicOptions. 
 newThresholds <- savedSelections$thresholds
 scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
 saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
 saveRDS(scenicOptions, file="int/scenicOptions.Rds")
 
+#Binarization of the regulon activity based on the thresholds.
 runSCENIC_4_aucell_binarize(scenicOptions)
 ```
 
 ```{r heatmap}
 scenicOptions <- readRDS("int/scenicOptions.Rds")
-scenicOptions@inputDatasetInfo$cellInfo <- "../int/cellInfo.Rds"
+scenicOptions@inputDatasetInfo$cellInfo <- "/int/cellInfo.Rds"
 scenicOptions@settings$devType <- "jpg"
 skipHeatmaps <- FALSE
 binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
@@ -140,15 +159,17 @@ if(!skipHeatmaps){
 
 
 ```{r tsne}
+#Calculate own tsne.
 require(philentropy)
 require(reshape2)
 
+#Calculate the distances of cells based on the binary regulon activity. 
 binaryRegulonActivity2 <- t(binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])])
 distanceall <- philentropy::distance(binaryRegulonActivity2, method="jaccard")
 colnames(distanceall) <- rownames(distanceall) <- rownames(binaryRegulonActivity2)
 #saveRDS(distanceall, file="~/distanceall.Rds")
 
-#distanceall <- readRDS("distanceall.Rds")
+#Calculate tsne coordinates from the distances. Color cells by the elements defined in cellInfo
 require(Rtsne)
 set.seed(123)
 tsnb <- Rtsne(distanceall, is_distance=TRUE, perplexity = 50)
@@ -168,6 +189,7 @@ binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
 binaryRegulonActivity <- binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])]
 
 #Condition GFP and AGG vs INT for betacells and GFP vs INT for alphacells
+#Calculate which regulons are more active or inactive in T2D patients compared to non-diabetic donors.
 nrow(binaryRegulonActivity)
 k <- data.frame(rownames=rownames(binaryRegulonActivity), "p-value"=0, "c interval low"=0, "c interval high"=0, "odds ratio"=0, "up_down"=0 )
 rownames(k) <- k[,1]
@@ -193,6 +215,7 @@ rownames(k)[which(k$p.value<(0.05/144))]
 ```
 
 ```{r PCA}
+#Perform a different dimensionality reduction method, PCA.
 binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
 binaryRegulonActivity <- binaryRegulonActivity[,which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$donor=="D3")])]
 pca <- prcomp(t(binaryRegulonActivity), scale.=FALSE)
